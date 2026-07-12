@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Environment — NEVER commit this
+.env
+.env.local
+.env.production
+
+# Prisma generated client
+node_modules/.prisma/
+generated/
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker local volumes
+postgres_data/
+redis_data/
+
+# Build artifacts
+dist/
+build/

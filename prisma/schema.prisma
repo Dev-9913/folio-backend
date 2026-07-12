@@ -1,0 +1,263 @@
+// ──────────────────────────────────────────────────────────────────────────────
+// Folio — Prisma Schema
+// ──────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ── Users ─────────────────────────────────────────────────────────────────────
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  clerkId   String   @unique @map("clerk_id")
+  name      String?  @db.VarChar(100)
+  email     String?  @unique @db.VarChar(255)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  books           Book[]
+  readingProgress ReadingProgress[]
+  highlights      Highlight[]
+  aiChats         AiChat[]
+  shelves         Shelf[]
+  chatSessions    ChatSession[]
+  purchases       Purchase[]
+
+  @@map("users")
+}
+
+// ── Books ─────────────────────────────────────────────────────────────────────
+model Book {
+  id          String    @id @db.VarChar(16)
+  userId      String    @map("user_id") @db.Uuid
+  title       String    @db.VarChar(500)
+  author      String?   @db.VarChar(300)
+  coverUrl    String?   @map("cover_url")
+  cloudSynced Boolean   @default(false)
+  lastReadAt  DateTime? @map("last_read_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  user             User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  readingProgress  ReadingProgress[]
+  highlights       Highlight[]
+  aiChats          AiChat[]
+  chapterSummaries ChapterSummary[]
+  shelfBooks       ShelfBook[]
+  chatSessions     ChatSession[]
+
+  @@index([userId])
+  @@index([userId, lastReadAt])
+  @@map("books")
+}
+
+// ── Reading Progress ──────────────────────────────────────────────────────────
+model ReadingProgress {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  bookId     String   @map("book_id") @db.VarChar(16)
+  cfi        String
+  percentage Decimal  @default(0) @db.Decimal(5, 2)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  book Book @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, bookId])
+  @@index([userId, bookId])
+  @@map("reading_progress")
+}
+
+// ── Highlights ────────────────────────────────────────────────────────────────
+model Highlight {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  bookId    String   @map("book_id") @db.VarChar(16)
+  cfi       String
+  text      String
+  note      String?
+  color     String   @default("#E8A83866") @db.VarChar(20)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  book Book @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  @@index([userId, bookId])
+  @@map("highlights")
+}
+
+// ── AI Chat History ───────────────────────────────────────────────────────────
+model AiChat {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  bookId    String?  @map("book_id") @db.VarChar(16)
+  cfi       String?
+  action    String?  @db.VarChar(50)
+  queryText String   @map("query_text")
+  response  String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  book Book? @relation(fields: [bookId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@map("ai_chats")
+}
+
+// ── Chapter Summaries ─────────────────────────────────────────────────────────
+model ChapterSummary {
+  id         String   @id @default(uuid()) @db.Uuid
+  bookId     String   @map("book_id") @db.VarChar(16)
+  chapterCfi String   @map("chapter_cfi")
+  summary    String
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  book Book @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  @@unique([bookId, chapterCfi])
+  @@map("chapter_summaries")
+}
+
+// ── Shelves ───────────────────────────────────────────────────────────────────
+model Shelf {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  name      String   @db.VarChar(100)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shelfBooks ShelfBook[]
+
+  @@index([userId])
+  @@map("shelves")
+}
+
+// ── Shelf ↔ Books ─────────────────────────────────────────────────────────────
+model ShelfBook {
+  shelfId String   @map("shelf_id") @db.Uuid
+  bookId  String   @map("book_id") @db.VarChar(16)
+  addedAt DateTime @default(now()) @map("added_at")
+
+  shelf Shelf @relation(fields: [shelfId], references: [id], onDelete: Cascade)
+  book  Book  @relation(fields: [bookId],  references: [id], onDelete: Cascade)
+
+  @@id([shelfId, bookId])
+  @@map("shelf_books")
+}
+
+// ── Chat Sessions ─────────────────────────────────────────────────────────────
+model ChatSession {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  bookId    String?  @map("book_id") @db.VarChar(16)
+  title     String   @default("New Chat") @db.VarChar(200)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  book     Book?         @relation(fields: [bookId], references: [id], onDelete: SetNull)
+  messages ChatMessage[]
+
+  @@index([userId, bookId])
+  @@map("chat_sessions")
+}
+
+// ── Chat Messages ─────────────────────────────────────────────────────────────
+model ChatMessage {
+  id        String      @id @default(uuid()) @db.Uuid
+  sessionId String      @map("session_id") @db.Uuid
+  role      MessageRole
+  content   String
+  createdAt DateTime    @default(now()) @map("created_at")
+
+  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("chat_messages")
+}
+// ── Purchases ───────────────────────────────────────────────────────────────
+model Purchase {
+  id                String         @id @default(uuid()) @db.Uuid
+  userId            String         @map("user_id") @db.Uuid
+  // Standard Ebooks slug, e.g. "mary-shelley/frankenstein" — permanent identifier,
+  // survives catalog re-scrapes/atomic-swaps since SE never changes a book's slug.
+  catalogBookId     String?        @map("catalog_book_id") @db.VarChar(300)
+  bookTitle         String         @map("book_title") @db.VarChar(500)
+  bookAuthor        String?        @map("book_author") @db.VarChar(300)
+  amountPaise       Int            @map("amount_paise")
+  razorpayOrderId   String?        @map("razorpay_order_id") @db.VarChar(100)
+  razorpayPaymentId String?        @map("razorpay_payment_id") @db.VarChar(100)
+  status            PurchaseStatus @default(PENDING)
+  bookId            String?        @map("book_id") @db.VarChar(16)
+  createdAt         DateTime       @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([catalogBookId])
+  @@map("purchases")
+}
+
+// ── Catalog (Standard Ebooks scrape) ──────────────────────────────────────────
+model CatalogBook {
+  // Standard Ebooks URL slug — e.g. "mary-shelley/frankenstein".
+  // Permanent and stable across re-scrapes; used as the purchase reference.
+  id             String   @id @db.VarChar(300)
+  title          String   @db.VarChar(500)
+  author         String   @db.VarChar(300)
+  coverUrl       String?  @map("cover_url")
+  epubUrl        String   @map("epub_url")
+  subjects       String[] @default([])
+  description    String?
+
+  // Mock paywall — deterministically assigned from a hash of `id` so it never
+  // changes between re-scrapes (a user's purchase stays valid; a free book
+  // never silently becomes paid and vice versa).
+  isPaid         Boolean  @default(false) @map("is_paid")
+  pricePaise     Int      @default(0) @map("price_paise")
+
+  // Featured sections — null when not in either list, otherwise 1-based rank
+  // pulled straight from Standard Ebooks' own `sort=popularity` / `sort=default`
+  // orderings. No popularity scoring computed on our side.
+  popularityRank Int?     @map("popularity_rank")
+  releaseRank    Int?     @map("release_rank")
+
+  // Atomic-swap bookkeeping — every row from one scrape run shares a batch id.
+  // Seeder inserts the new batch, then deletes every row whose batch doesn't
+  // match, so the catalog table is never empty/partial mid-refresh.
+  scrapeBatch    String   @map("scrape_batch") @db.VarChar(40)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([scrapeBatch])
+  @@index([popularityRank])
+  @@index([releaseRank])
+  @@map("catalog_books")
+}
+
+// Single-row table tracking when the catalog was last refreshed.
+model CatalogMeta {
+  id           Int      @id @default(1)
+  lastScraped  DateTime @map("last_scraped")
+  bookCount    Int      @map("book_count")
+  currentBatch String   @map("current_batch") @db.VarChar(40)
+
+  @@map("catalog_meta")
+}
+
+enum MessageRole {
+  user
+  assistant
+}
+
+enum PurchaseStatus {
+  PENDING
+  PAID
+  DELIVERED
+  FAILED
+}
