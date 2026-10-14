@@ -13,7 +13,7 @@ async function generateText(prompt, { maxTokens = 1024, temperature = 0.7 } = {}
   const client = getAI()
   if (!client) return null
   const response = await client.models.generateContent({
-    model:    'gemini-2.5-flash',
+    model:    'gemini-3.6-flash',
     contents: prompt,
     config:   {
       maxOutputTokens: maxTokens,
@@ -67,6 +67,7 @@ export async function handleChat({ message, history, bookId, bookTitle, progress
 }
 
 // ── Imagine — context-aware prompt + 3-layer image generation fallback ────────
+// ── Imagine — context-aware prompt + Concurrent Image Racing & Parallel Execution ──
 export async function handleImagine({ text, bookId, bookTitle, progress }) {
   const cacheKey = `imagine:${bookId}:${hashStr(text)}`
   const cached   = await cacheGet(cacheKey)
@@ -75,33 +76,24 @@ export async function handleImagine({ text, bookId, bookTitle, progress }) {
   const client = getAI()
   const pct    = Math.round(progress || 0)
 
-  // ── Single Gemini call: excerpt + book title + progress → detailed image prompt
-  // Gemini uses its training knowledge of the book AND the raw excerpt together.
-  // This gives character appearances (skin, hair, clothing, distinctive features),
-  // world/setting details, and the exact mood of this scene — all in one shot.
+  // 1. Generate the enriched image prompt first
   let imagePrompt = `Cinematic fantasy illustration of a scene from "${bookTitle || 'a novel'}": ${text.slice(0, 200)}, painterly, highly detailed, dramatic lighting`
 
   try {
     if (client) {
       const enriched = await generateText(
-         `You are an expert at writing photorealistic image generation prompts for literary scenes.\n\n` +
+        `You are an expert at writing photorealistic image generation prompts for literary scenes.\n\n` +
         `Book: "${bookTitle || 'Unknown'}"\n` +
         `Reader is ${pct}% through the book.\n\n` +
         `Excerpt:\n"${text.slice(0, 600)}"\n\n` +
         `Using your knowledge of this book AND the excerpt above, write a single image generation prompt (80-120 words) that:\n` +
-        `1. Names and physically describes every character present — ` +
-        `exact skin tone, hair color, eye color, face structure, build, and the precise clothing or armor they wear in this book. ` +
-        `Include distinctive features (scars, unusual eyes, glowing effects, etc.)\n` +
-        `2. Describes the specific real-world setting — architecture, landscape, weather, natural or artificial light sources, time of day, colors\n` +
-        `3. Captures the exact action and emotional tension of this moment\n` +
-        `4. Ends with ONLY these style keywords (copy them exactly): ` +
-        `photorealistic, cinematic photography, 85mm lens, shallow depth of field, cinematic lighting, ` +
-        `film grain, 8K resolution, hyperrealistic, shot on Sony A7R, RAW photo\n\n` +
+        `1. Names and physically describes every character present — exact skin tone, hair color, eye color, face structure, build, and precise clothing. Include distinctive features.\n` +
+        `2. Describes specific setting — architecture, landscape, weather, lighting, time of day, colors.\n` +
+        `3. Captures exact action and emotional tension.\n` +
+        `4. Ends with ONLY these style keywords: photorealistic, cinematic photography, 85mm lens, shallow depth of field, cinematic lighting, film grain, 8K resolution, hyperrealistic, shot on Sony A7R, RAW photo\n\n` +
         `CRITICAL RULES:\n` +
         `- Never use words like: illustration, painting, artwork, drawn, render, fantasy art, anime, cartoon, digital art, concept art\n` +
-        `- Describe characters as real people with real proportions, not stylized\n` +
-        `- Be extremely specific — no vague descriptions like "a warrior" or "a young woman"\n` +
-        `- Output only the prompt text, no preamble, no commentary, no quotes around it`,
+        `- Output only the prompt text, no preamble, no quotes around it`,
         { maxTokens: 400, temperature: 0.6 }
       )
       if (enriched) imagePrompt = enriched.trim()
@@ -111,119 +103,110 @@ export async function handleImagine({ text, bookId, bookTitle, progress }) {
     console.warn('[Imagine] Prompt generation failed:', err.message)
   }
 
-  // ── Helper: convert raw image blob response → base64 data URL ────────────
-async function blobResponseToBase64(response) {
-  const contentType = response.headers.get('content-type') || 'image/jpeg'
-  // Reject if server returned JSON (error body) instead of an image
-  if (contentType.includes('application/json')) {
-    const body = await response.text()
-    throw new Error(`Expected image, got JSON: ${body.slice(0, 200)}`)
+  // Helper: convert raw image blob response → base64 data URL
+  async function blobResponseToBase64(response) {
+    const contentType = response.headers.get('content-type') || 'image/jpeg'
+    if (contentType.includes('application/json')) {
+      const body = await response.text()
+      throw new Error(`Expected image, got JSON: ${body.slice(0, 200)}`)
+    }
+    const arrayBuffer = await response.arrayBuffer()
+    if (arrayBuffer.byteLength < 1000) {
+      throw new Error(`Response too small: ${arrayBuffer.byteLength} bytes`)
+    }
+    const base64 = Buffer.from(arrayBuffer).toString('base64')
+    return `data:${contentType.split(';')[0]};base64,${base64}`
   }
-  const arrayBuffer = await response.arrayBuffer()
-  // Reject suspiciously small responses (likely an error page, not an image)
-  if (arrayBuffer.byteLength < 1000) {
-    throw new Error(`Response too small to be an image: ${arrayBuffer.byteLength} bytes`)
+
+  // Helper to fetch from an image API with a clean timeout
+  async function fetchModel(url, key, payload, timeoutMs = 20000, modelName = 'Model') {
+    console.log(`[Imagine] Trying ${modelName}...`)
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!res.ok) throw new Error(`${modelName} failed (${res.status}): ${await res.text()}`)
+    const base64 = await blobResponseToBase64(res)
+    console.log(`[Imagine] ${modelName} success!`)
+    return base64
   }
-  const base64 = Buffer.from(arrayBuffer).toString('base64')
-  return `data:${contentType.split(';')[0]};base64,${base64}`
-}
 
-  let imageUrl = null
+  // 2. Define the Concurrent Image Generation Strategy
+  async function getWinningImage() {
+    const tasks = []
 
-  // ── Layer 1: HuggingFace FLUX.1-schnell (fastest, best quality) ──────────
-  if (!imageUrl && process.env.HF_TOKEN) {
+    // Fire both HuggingFace models AT THE SAME TIME (Give them 20s each to breathe)
+    if (process.env.HF_TOKEN) {
+      tasks.push(
+        fetchModel(
+          'https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell',
+          process.env.HF_TOKEN,
+          { inputs: imagePrompt },
+          20000,
+          'HF FLUX.1-schnell'
+        )
+      )
+      tasks.push(
+        fetchModel(
+          'https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-3-medium-diffusers',
+          process.env.HF_TOKEN,
+          { inputs: imagePrompt },
+          20000,
+          'HF SD3-medium'
+        )
+      )
+    }
+
     try {
-      console.log('[Imagine] Trying HF FLUX.1-schnell...')
-      const res = await fetch(
-        'https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell',
-        {
-          method:  'POST',
-          headers: {
-            'Authorization': `Bearer ${process.env.HF_TOKEN}`,
-            'Content-Type':  'application/json',
-          },
-          body:   JSON.stringify({ inputs: imagePrompt }),
-          signal: AbortSignal.timeout(25000),
+      // Promise.any resolves the instant the FIRST model finishes successfully!
+      // If FLUX hangs, SD3 wins the race and returns in ~10 seconds.
+      return await Promise.any(tasks)
+    } catch (err) {
+      console.warn('[Imagine] Both HF models failed or timed out. Falling back to Cloudflare...')
+      
+      // Layer 3 Fallback: Only run Cloudflare if both HF models failed the race
+      if (process.env.CF_IMAGE_URL && process.env.CF_IMAGE_KEY) {
+        try {
+          return await fetchModel(
+            process.env.CF_IMAGE_URL,
+            process.env.CF_IMAGE_KEY,
+            { prompt: imagePrompt },
+            20000,
+            'Cloudflare SDXL'
+          )
+        } catch (cfErr) {
+          console.warn('[Imagine] Cloudflare error:', cfErr.message)
         }
-      )
-      if (res.ok) {
-        imageUrl = await blobResponseToBase64(res)
-        console.log('[Imagine] FLUX.1-schnell success')
-      } else {
-        console.warn('[Imagine] FLUX.1-schnell failed:', res.status, await res.text())
       }
-    } catch (err) {
-      console.warn('[Imagine] FLUX.1-schnell error:', err.message)
+      return null
     }
   }
 
-  // ── Layer 2: HuggingFace stable-diffusion-3-medium ───────────────────────
-  if (!imageUrl && process.env.HF_TOKEN) {
+  // 3. Define the Scene Description Task
+  async function getDescription() {
     try {
-      console.log('[Imagine] Trying HF SD3-medium...')
-      const res = await fetch(
-        'https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-3-medium-diffusers',
-        {
-          method:  'POST',
-          headers: {
-            'Authorization': `Bearer ${process.env.HF_TOKEN}`,
-            'Content-Type':  'application/json',
-          },
-          body:   JSON.stringify({ inputs: imagePrompt }),
-          signal: AbortSignal.timeout(30000),
-        }
-      )
-      if (res.ok) {
-        imageUrl = await blobResponseToBase64(res)
-        console.log('[Imagine] SD3-medium success')
-      } else {
-        console.warn('[Imagine] SD3-medium failed:', res.status, await res.text())
+      if (client) {
+        return await generateText(
+          `In 2-3 vivid sentences, describe what this scene looks like visually — ` +
+          `the characters, setting, lighting, and mood. Write as if describing a painting. ` +
+          `Scene from "${bookTitle || 'the book'}" (${pct}% through):\n"${text.slice(0, 300)}"`,
+          { maxTokens: 150, temperature: 0.75 }
+        )
       }
-    } catch (err) {
-      console.warn('[Imagine] SD3-medium error:', err.message)
-    }
+    } catch {}
+    return `${text.slice(0, 150)}…`
   }
 
-  // ── Layer 3: Cloudflare Worker (SDXL-base-1.0) ───────────────────────────
-  if (!imageUrl && process.env.CF_IMAGE_URL && process.env.CF_IMAGE_KEY) {
-    try {
-      console.log('[Imagine] Trying Cloudflare SDXL...')
-      const res = await fetch(process.env.CF_IMAGE_URL, {
-        method:  'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.CF_IMAGE_KEY}`,
-          'Content-Type':  'application/json',
-        },
-        body:   JSON.stringify({ prompt: imagePrompt }),
-        signal: AbortSignal.timeout(30000),
-      })
-      if (res.ok) {
-        imageUrl = await blobResponseToBase64(res)
-        console.log('[Imagine] Cloudflare SDXL success')
-      } else {
-        console.warn('[Imagine] Cloudflare SDXL failed:', res.status, await res.text())
-      }
-    } catch (err) {
-      console.warn('[Imagine] Cloudflare SDXL error:', err.message)
-    }
-  }
-
-  // ── Scene description: always generated, shown below image or alone ───────
-  let description = null
-  try {
-    if (client) {
-      description = await generateText(
-        `In 2-3 vivid sentences, describe what this scene looks like visually — ` +
-        `the characters, setting, lighting, and mood. Write as if describing a painting. ` +
-        `Scene from "${bookTitle || 'the book'}" (${pct}% through):\n"${text.slice(0, 300)}"`,
-        { maxTokens: 150, temperature: 0.75 }
-      )
-    }
-  } catch {}
-
-  if (!description) {
-    description = `${text.slice(0, 150)}…`
-  }
+  // 4. EXECUTE IN PARALLEL: Image Race + Text Description run at the same time!
+  const [imageUrl, description] = await Promise.all([
+    getWinningImage(),
+    getDescription()
+  ])
 
   const result = {
     imageUrl,
@@ -231,6 +214,7 @@ async function blobResponseToBase64(response) {
     description,
     placeholder: !imageUrl,
   }
+  
   await cacheSet(cacheKey, result, imageUrl ? 86400 : 300)
   return result
 }
